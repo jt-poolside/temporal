@@ -1,7 +1,6 @@
 package activity
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -168,7 +167,7 @@ type MetricsHandlerBuilderParams struct {
 }
 
 // GetMetricsHandlerParams retrieves parameters for building a metrics handler for activity operations.
-func (a *Activity) GetMetricsHandlerParams(_ chasm.Context, _ context.Context) (MetricsHandlerBuilderParams, error) {
+func (a *Activity) GetMetricsHandlerParams(_ chasm.Context, _ any) (MetricsHandlerBuilderParams, error) {
 	return MetricsHandlerBuilderParams{
 		ActivityType:  a.GetActivityType().GetName(),
 		TaskQueueName: a.GetTaskQueue().GetName(),
