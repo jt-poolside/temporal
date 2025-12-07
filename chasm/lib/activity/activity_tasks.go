@@ -10,6 +10,7 @@ import (
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/resource"
+	"go.temporal.io/server/common/tqid"
 	"go.temporal.io/server/common/util"
 	"go.uber.org/fx"
 )
@@ -76,6 +77,7 @@ func (e *activityDispatchTaskExecutor) Execute(
 type timeoutTaskExecutorOptions struct {
 	fx.In
 
+	// TODO Once heartbeat branch is rebased, use the config struct to initialize it in fx instead of using the collection directly.
 	Dc                *dynamicconfig.Collection
 	MetricsHandler    metrics.Handler
 	NamespaceRegistry namespace.Registry
@@ -114,17 +116,28 @@ func (e *scheduleToStartTimeoutTaskExecutor) Execute(
 	_ chasm.TaskAttributes,
 	_ *activitypb.ScheduleToStartTimeoutTask,
 ) error {
+	breakdownMetricsByTaskQueue := dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc)
 	nsID := namespace.ID(ctx.ExecutionKey().NamespaceID)
 	namespaceName, err := e.opts.NamespaceRegistry.GetNamespaceName(nsID)
 	if err != nil {
 		return err
 	}
 
+	taskQueueFamily := activity.GetTaskQueue().GetName()
+
+	metricsHandler := metrics.GetPerTaskQueueFamilyScope(
+		e.opts.MetricsHandler,
+		namespaceName.String(),
+		tqid.UnsafeTaskQueueFamily(namespaceName.String(), taskQueueFamily),
+		breakdownMetricsByTaskQueue(namespaceName.String(), taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
+		metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
+		metrics.ActivityTypeTag(activity.GetActivityType().GetName()),
+		metrics.VersioningBehaviorTag(enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED),
+	)
+
 	event := timeoutEvent{
-		namespaceName:               namespaceName,
-		timeoutType:                 enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
-		metricsHandler:              e.opts.MetricsHandler,
-		breakdownMetricsByTaskQueue: dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc),
+		timeoutType:    enumspb.TIMEOUT_TYPE_SCHEDULE_TO_START,
+		metricsHandler: metricsHandler,
 	}
 
 	return TransitionTimedOut.Apply(activity, ctx, event)
@@ -157,17 +170,28 @@ func (e *scheduleToCloseTimeoutTaskExecutor) Execute(
 	_ chasm.TaskAttributes,
 	_ *activitypb.ScheduleToCloseTimeoutTask,
 ) error {
+	breakdownMetricsByTaskQueue := dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc)
 	nsID := namespace.ID(ctx.ExecutionKey().NamespaceID)
 	namespaceName, err := e.opts.NamespaceRegistry.GetNamespaceName(nsID)
 	if err != nil {
 		return err
 	}
 
+	taskQueueFamily := activity.GetTaskQueue().GetName()
+
+	metricsHandler := metrics.GetPerTaskQueueFamilyScope(
+		e.opts.MetricsHandler,
+		namespaceName.String(),
+		tqid.UnsafeTaskQueueFamily(namespaceName.String(), taskQueueFamily),
+		breakdownMetricsByTaskQueue(namespaceName.String(), taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
+		metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
+		metrics.ActivityTypeTag(activity.GetActivityType().GetName()),
+		metrics.VersioningBehaviorTag(enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED),
+	)
+
 	event := timeoutEvent{
-		namespaceName:               namespaceName,
-		timeoutType:                 enumspb.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE,
-		metricsHandler:              e.opts.MetricsHandler,
-		breakdownMetricsByTaskQueue: dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc),
+		timeoutType:    enumspb.TIMEOUT_TYPE_SCHEDULE_TO_CLOSE,
+		metricsHandler: metricsHandler,
 	}
 
 	return TransitionTimedOut.Apply(activity, ctx, event)
@@ -212,32 +236,44 @@ func (e *startToCloseTimeoutTaskExecutor) Execute(
 	}
 
 	breakdownMetricsByTaskQueue := dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc)
-	metricsHandler := e.opts.MetricsHandler
 	nsID := namespace.ID(ctx.ExecutionKey().NamespaceID)
 	namespaceName, err := e.opts.NamespaceRegistry.GetNamespaceName(nsID)
 	if err != nil {
 		return err
 	}
 
+	taskQueueFamily := activity.GetTaskQueue().GetName()
+
+	metricsHandler := metrics.GetPerTaskQueueFamilyScope(
+		e.opts.MetricsHandler,
+		namespaceName.String(),
+		tqid.UnsafeTaskQueueFamily(namespaceName.String(), taskQueueFamily),
+		breakdownMetricsByTaskQueue(namespaceName.String(), taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
+		metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
+		metrics.ActivityTypeTag(activity.GetActivityType().GetName()),
+		metrics.VersioningBehaviorTag(enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED),
+	)
+
 	// Retry task if we have remaining attempts and time. A retry involves transitioning the activity back to scheduled state.
 	if shouldRetry {
-		return TransitionRescheduled.Apply(activity, ctx, rescheduleEvent{
-			retryInterval:               retryInterval,
-			failure:                     createStartToCloseTimeoutFailure(),
-			handler:                     metricsHandler,
-			namespace:                   namespaceName,
-			breakdownMetricsByTaskQueue: breakdownMetricsByTaskQueue,
-			timeoutType:                 enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
-			operationTag:                metrics.TimerActiveTaskActivityTimeoutScope,
+		err = TransitionRescheduled.Apply(activity, ctx, rescheduleEvent{
+			retryInterval: retryInterval,
+			failure:       createStartToCloseTimeoutFailure(),
+			timeoutType:   enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
 		})
+		if err != nil {
+			return err
+		}
+
+		activity.emitOnAttemptTimedOutMetrics(ctx, metricsHandler, enumspb.TIMEOUT_TYPE_START_TO_CLOSE)
+
+		return nil
 	}
 
 	// Reached maximum attempts, timeout the activity
 	return TransitionTimedOut.Apply(activity, ctx, timeoutEvent{
-		namespaceName:               namespaceName,
-		timeoutType:                 enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
-		metricsHandler:              metricsHandler,
-		breakdownMetricsByTaskQueue: breakdownMetricsByTaskQueue,
+		timeoutType:    enumspb.TIMEOUT_TYPE_START_TO_CLOSE,
+		metricsHandler: metricsHandler,
 	})
 }
 
@@ -320,12 +356,23 @@ func (e *heartbeatTimeoutTaskExecutor) Execute(
 	}
 
 	breakdownMetricsByTaskQueue := dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc)
-	metricsHandler := e.opts.MetricsHandler
 	nsID := namespace.ID(ctx.ExecutionKey().NamespaceID)
 	namespaceName, err := e.opts.NamespaceRegistry.GetNamespaceName(nsID)
 	if err != nil {
 		return err
 	}
+
+	taskQueueFamily := activity.GetTaskQueue().GetName()
+
+	metricsHandler := metrics.GetPerTaskQueueFamilyScope(
+		e.opts.MetricsHandler,
+		namespaceName.String(),
+		tqid.UnsafeTaskQueueFamily(namespaceName.String(), taskQueueFamily),
+		breakdownMetricsByTaskQueue(namespaceName.String(), taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
+		metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
+		metrics.ActivityTypeTag(activity.GetActivityType().GetName()),
+		metrics.VersioningBehaviorTag(enumspb.VERSIONING_BEHAVIOR_UNSPECIFIED),
+	)
 
 	// Fail this attempt due to heartbeat timeout.
 	shouldRetry, retryInterval, err := activity.shouldRetry(ctx, 0)
@@ -333,21 +380,22 @@ func (e *heartbeatTimeoutTaskExecutor) Execute(
 		return err
 	}
 	if shouldRetry {
-		return TransitionRescheduled.Apply(activity, ctx, rescheduleEvent{
-			retryInterval:               retryInterval,
-			failure:                     createHeartbeatTimeoutFailure(),
-			handler:                     metricsHandler,
-			namespace:                   namespaceName,
-			breakdownMetricsByTaskQueue: breakdownMetricsByTaskQueue,
-			timeoutType:                 enumspb.TIMEOUT_TYPE_HEARTBEAT,
-			operationTag:                metrics.TimerActiveTaskActivityTimeoutScope,
+		err = TransitionRescheduled.Apply(activity, ctx, rescheduleEvent{
+			retryInterval: retryInterval,
+			failure:       createHeartbeatTimeoutFailure(),
+			timeoutType:   enumspb.TIMEOUT_TYPE_HEARTBEAT,
 		})
+		if err != nil {
+			return err
+		}
+
+		activity.emitOnAttemptTimedOutMetrics(ctx, metricsHandler, enumspb.TIMEOUT_TYPE_HEARTBEAT)
+
+		return nil
 	}
 
 	return TransitionTimedOut.Apply(activity, ctx, timeoutEvent{
-		namespaceName:               namespaceName,
-		timeoutType:                 enumspb.TIMEOUT_TYPE_HEARTBEAT,
-		metricsHandler:              e.opts.MetricsHandler,
-		breakdownMetricsByTaskQueue: dynamicconfig.MetricsBreakdownByTaskQueue.Get(e.opts.Dc),
+		timeoutType:    enumspb.TIMEOUT_TYPE_HEARTBEAT,
+		metricsHandler: metricsHandler,
 	})
 }

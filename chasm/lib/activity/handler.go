@@ -11,8 +11,6 @@ import (
 	"go.temporal.io/api/workflowservice/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/activity/gen/activitypb/v1"
-	"go.temporal.io/server/common/metrics"
-	"go.temporal.io/server/common/namespace"
 )
 
 var (
@@ -31,19 +29,10 @@ var (
 
 type handler struct {
 	activitypb.UnimplementedActivityServiceServer
-
-	metricsHandler    metrics.Handler
-	NamespaceRegistry namespace.Registry
 }
 
-func newHandler(
-	metricsHandler metrics.Handler,
-	namespaceRegistry namespace.Registry,
-) *handler {
-	return &handler{
-		metricsHandler:    metricsHandler,
-		NamespaceRegistry: namespaceRegistry,
-	}
+func newHandler() *handler {
+	return &handler{}
 }
 
 func (h *handler) StartActivityExecution(ctx context.Context, req *activitypb.StartActivityExecutionRequest) (*activitypb.StartActivityExecutionResponse, error) {
@@ -71,16 +60,7 @@ func (h *handler) StartActivityExecution(ctx context.Context, req *activitypb.St
 				return nil, nil, err
 			}
 
-			namespaceName, err := h.NamespaceRegistry.GetNamespaceName(namespace.ID(req.GetNamespaceId()))
-			if err != nil {
-				return nil, nil, err
-			}
-
-			err = TransitionScheduled.Apply(newActivity, mutableContext, scheduleEvent{
-				handler:   h.metricsHandler,
-				namespace: namespaceName,
-				inputSize: frontendReq.GetInput().Size(),
-			})
+			err = TransitionScheduled.Apply(newActivity, mutableContext, nil)
 			if err != nil {
 				return nil, nil, err
 			}

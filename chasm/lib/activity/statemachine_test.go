@@ -13,7 +13,6 @@ import (
 	"go.temporal.io/server/api/historyservice/v1"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/activity/gen/activitypb/v1"
-	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/payloads"
 	"go.temporal.io/server/common/testing/protorequire"
@@ -103,24 +102,7 @@ func TestTransitionScheduled(t *testing.T) {
 				Outcome: chasm.NewDataField(ctx, outcome),
 			}
 
-			controller := gomock.NewController(t)
-			metricsHandler := metrics.NewMockHandler(controller)
-			payloadSize := input.Size()
-			counter := metrics.NewMockCounterIface(controller)
-			counter.EXPECT().Record(
-				int64(payloadSize),
-				metrics.OperationTag(metrics.HistoryRecordActivityTaskStartedScope),
-				metrics.NamespaceTag("test-namespace"),
-			).Times(1)
-			metricsHandler.EXPECT().Counter(metrics.ActivityPayloadSize.Name()).Return(counter)
-
-			event := scheduleEvent{
-				handler:   metricsHandler,
-				namespace: "test-namespace",
-				inputSize: payloadSize,
-			}
-
-			err := TransitionScheduled.Apply(activity, ctx, event)
+			err := TransitionScheduled.Apply(activity, ctx, nil)
 			require.NoError(t, err)
 			require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_SCHEDULED, activity.Status)
 			require.EqualValues(t, 1, attemptState.Count)
@@ -253,38 +235,10 @@ func TestTransitionRescheduled(t *testing.T) {
 				Outcome: chasm.NewDataField(ctx, outcome),
 			}
 
-			controller := gomock.NewController(t)
-
-			tags := []metrics.Tag{
-				metrics.OperationTag(tc.operationTag),
-				metrics.ActivityTypeTag("test-activity-type"),
-				metrics.NamespaceTag("test-namespace"),
-				metrics.UnsafeTaskQueueTag("test-task-queue"),
-			}
-			metricsHandler := metrics.NewMockHandler(controller)
-			metricsHandler.EXPECT().WithTags(tags).Return(metricsHandler).Times(1)
-
-			timerStartToCloseLatency := metrics.NewMockTimerIface(controller)
-			timerStartToCloseLatency.EXPECT().Record(gomock.Any()).Times(1)
-			metricsHandler.EXPECT().Timer(metrics.ActivityStartToCloseLatency.Name()).Return(timerStartToCloseLatency)
-
-			counter := metrics.NewMockCounterIface(controller)
-			if tc.operationTag == metrics.TimerActiveTaskActivityTimeoutScope {
-				timeoutTag := metrics.StringTag("timeout_type", tc.timeoutType.String())
-				counter.EXPECT().Record(int64(1), timeoutTag).Times(1)
-			} else {
-				counter.EXPECT().Record(int64(1)).Times(1)
-			}
-			metricsHandler.EXPECT().Counter(tc.counterMetric).Return(counter)
-
 			event := rescheduleEvent{
-				retryInterval:               tc.expectedRetryInterval,
-				failure:                     createStartToCloseTimeoutFailure(),
-				handler:                     metricsHandler,
-				namespace:                   "test-namespace",
-				breakdownMetricsByTaskQueue: dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(true),
-				timeoutType:                 tc.timeoutType,
-				operationTag:                tc.operationTag,
+				retryInterval: tc.expectedRetryInterval,
+				failure:       createStartToCloseTimeoutFailure(),
+				timeoutType:   tc.timeoutType,
 			}
 
 			err := TransitionRescheduled.Apply(activity, ctx, event)
@@ -413,15 +367,7 @@ func TestTransitionTimedout(t *testing.T) {
 			}
 
 			controller := gomock.NewController(t)
-
-			tags := []metrics.Tag{
-				metrics.OperationTag(metrics.TimerActiveTaskActivityTimeoutScope),
-				metrics.ActivityTypeTag("test-activity-type"),
-				metrics.NamespaceTag("test-namespace"),
-				metrics.UnsafeTaskQueueTag("test-task-queue"),
-			}
 			metricsHandler := metrics.NewMockHandler(controller)
-			metricsHandler.EXPECT().WithTags(tags).Return(metricsHandler).Times(2)
 
 			timerStartToCloseLatency := metrics.NewMockTimerIface(controller)
 			timerStartToCloseLatency.EXPECT().Record(gomock.Any()).Times(1)
@@ -442,10 +388,8 @@ func TestTransitionTimedout(t *testing.T) {
 			metricsHandler.EXPECT().Counter(metrics.ActivityTaskTimeout.Name()).Return(counterTaskTimeout)
 
 			event := timeoutEvent{
-				timeoutType:                 tc.timeoutType,
-				metricsHandler:              metricsHandler,
-				namespaceName:               "test-namespace",
-				breakdownMetricsByTaskQueue: dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(true),
+				timeoutType:    tc.timeoutType,
+				metricsHandler: metricsHandler,
 			}
 
 			err := TransitionTimedOut.Apply(activity, ctx, event)
@@ -505,15 +449,7 @@ func TestTransitionCompleted(t *testing.T) {
 	payload := payloads.EncodeString("Done")
 
 	controller := gomock.NewController(t)
-
-	tags := []metrics.Tag{
-		metrics.OperationTag(metrics.HistoryRespondActivityTaskCompletedScope),
-		metrics.ActivityTypeTag("test-activity-type"),
-		metrics.NamespaceTag("test-namespace"),
-		metrics.UnsafeTaskQueueTag("test-task-queue"),
-	}
 	metricsHandler := metrics.NewMockHandler(controller)
-	metricsHandler.EXPECT().WithTags(tags).Return(metricsHandler).Times(2)
 
 	timerStartToCloseLatency := metrics.NewMockTimerIface(controller)
 	timerStartToCloseLatency.EXPECT().Record(gomock.Any()).Times(1)
@@ -527,27 +463,17 @@ func TestTransitionCompleted(t *testing.T) {
 	counterSuccess.EXPECT().Record(int64(1)).Times(1)
 	metricsHandler.EXPECT().Counter(metrics.ActivitySuccess.Name()).Return(counterSuccess)
 
-	counterPayloadSize := metrics.NewMockCounterIface(controller)
-	counterPayloadSize.EXPECT().Record(
-		int64(payload.Size()),
-		metrics.OperationTag(metrics.HistoryRespondActivityTaskCompletedScope),
-		metrics.NamespaceTag("test-namespace"),
-	).Times(1)
-	metricsHandler.EXPECT().Counter(metrics.ActivityPayloadSize.Name()).Return(counterPayloadSize)
-
-	reqWithCtx := RequestWithContext[*historyservice.RespondActivityTaskCompletedRequest]{
+	req := RespondCompletedReqWrapper{
 		Request: &historyservice.RespondActivityTaskCompletedRequest{
 			CompleteRequest: &workflowservice.RespondActivityTaskCompletedRequest{
 				Result:   payload,
 				Identity: "worker",
 			},
 		},
-		MetricsHandler:              metricsHandler,
-		NamespaceName:               "test-namespace",
-		BreakdownMetricsByTaskQueue: dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(true),
+		MetricsHandler: metricsHandler,
 	}
 
-	err := TransitionCompleted.Apply(activity, ctx, reqWithCtx)
+	err := TransitionCompleted.Apply(activity, ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_COMPLETED, activity.Status)
 	require.EqualValues(t, 1, attemptState.Count)
@@ -588,15 +514,7 @@ func TestTransitionFailed(t *testing.T) {
 	}
 
 	controller := gomock.NewController(t)
-
-	tags := []metrics.Tag{
-		metrics.OperationTag(metrics.HistoryRespondActivityTaskFailedScope),
-		metrics.ActivityTypeTag("test-activity-type"),
-		metrics.NamespaceTag("test-namespace"),
-		metrics.UnsafeTaskQueueTag("test-task-queue"),
-	}
 	metricsHandler := metrics.NewMockHandler(controller)
-	metricsHandler.EXPECT().WithTags(tags).Return(metricsHandler).Times(2)
 
 	timerStartToCloseLatency := metrics.NewMockTimerIface(controller)
 	timerStartToCloseLatency.EXPECT().Record(gomock.Any()).Times(1)
@@ -614,15 +532,7 @@ func TestTransitionFailed(t *testing.T) {
 	counterTaskFail.EXPECT().Record(int64(1)).Times(1)
 	metricsHandler.EXPECT().Counter(metrics.ActivityTaskFail.Name()).Return(counterTaskFail)
 
-	counterPayloadSize := metrics.NewMockCounterIface(controller)
-	counterPayloadSize.EXPECT().Record(
-		int64(failure.Size()),
-		metrics.OperationTag(metrics.HistoryRespondActivityTaskFailedScope),
-		metrics.NamespaceTag("test-namespace"),
-	).Times(1)
-	metricsHandler.EXPECT().Counter(metrics.ActivityPayloadSize.Name()).Return(counterPayloadSize)
-
-	reqWithCtx := RequestWithContext[*historyservice.RespondActivityTaskFailedRequest]{
+	req := RespondFailedReqWrapper{
 		Request: &historyservice.RespondActivityTaskFailedRequest{
 			FailedRequest: &workflowservice.RespondActivityTaskFailedRequest{
 				Failure:              failure,
@@ -630,12 +540,10 @@ func TestTransitionFailed(t *testing.T) {
 				Identity:             "worker",
 			},
 		},
-		MetricsHandler:              metricsHandler,
-		NamespaceName:               "test-namespace",
-		BreakdownMetricsByTaskQueue: dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(true),
+		MetricsHandler: metricsHandler,
 	}
 
-	err := TransitionFailed.Apply(activity, ctx, reqWithCtx)
+	err := TransitionFailed.Apply(activity, ctx, req)
 
 	require.NoError(t, err)
 	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_FAILED, activity.Status)
@@ -740,15 +648,7 @@ func TestTransitionCanceled(t *testing.T) {
 	}
 
 	controller := gomock.NewController(t)
-
-	tags := []metrics.Tag{
-		metrics.OperationTag(metrics.HistoryRespondActivityTaskCanceledScope),
-		metrics.ActivityTypeTag("test-activity-type"),
-		metrics.NamespaceTag("test-namespace"),
-		metrics.UnsafeTaskQueueTag("test-task-queue"),
-	}
 	metricsHandler := metrics.NewMockHandler(controller)
-	metricsHandler.EXPECT().WithTags(tags).Return(metricsHandler).Times(2)
 
 	timerStartToCloseLatency := metrics.NewMockTimerIface(controller)
 	timerStartToCloseLatency.EXPECT().Record(gomock.Any()).Times(1)
@@ -762,18 +662,16 @@ func TestTransitionCanceled(t *testing.T) {
 	counterCancel.EXPECT().Record(int64(1)).Times(1)
 	metricsHandler.EXPECT().Counter(metrics.ActivityCancel.Name()).Return(counterCancel)
 
-	reqWithCtx := RequestWithContext[*historyservice.RespondActivityTaskCanceledRequest]{
+	req := RespondCancelledReqWrapper{
 		Request: &historyservice.RespondActivityTaskCanceledRequest{
 			CancelRequest: &workflowservice.RespondActivityTaskCanceledRequest{
 				Details: payloads.EncodeString("Details"),
 			},
 		},
-		MetricsHandler:              metricsHandler,
-		NamespaceName:               "test-namespace",
-		BreakdownMetricsByTaskQueue: dynamicconfig.GetBoolPropertyFnFilteredByTaskQueue(true),
+		MetricsHandler: metricsHandler,
 	}
 
-	err := TransitionCanceled.Apply(activity, ctx, reqWithCtx)
+	err := TransitionCanceled.Apply(activity, ctx, req)
 	require.NoError(t, err)
 	require.Equal(t, activitypb.ACTIVITY_EXECUTION_STATUS_CANCELED, activity.Status)
 

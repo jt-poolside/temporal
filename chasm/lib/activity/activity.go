@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
@@ -21,10 +22,7 @@ import (
 	"go.temporal.io/server/chasm/lib/activity/gen/activitypb/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
-	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/metrics"
-	"go.temporal.io/server/common/namespace"
-	"go.temporal.io/server/common/tqid"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -58,13 +56,31 @@ type Activity struct {
 	Store chasm.Field[ActivityStore]
 }
 
-// RequestWithContext wraps a request context specific metadata.
-type RequestWithContext[R any] struct {
-	Request                     R
-	Token                       *tokenspb.Task
-	MetricsHandler              metrics.Handler
-	NamespaceName               namespace.Name
-	BreakdownMetricsByTaskQueue dynamicconfig.BoolPropertyFnWithTaskQueueFilter
+// WithToken wraps a request with its deserialized task token.
+type WithToken[R any] struct {
+	Token   *tokenspb.Task
+	Request R
+}
+
+// RespondCompletedReqWrapper wraps the RespondActivityTaskCompletedRequest with context-specific data.
+type RespondCompletedReqWrapper struct {
+	Request        *historyservice.RespondActivityTaskCompletedRequest
+	Token          *tokenspb.Task
+	MetricsHandler metrics.Handler
+}
+
+// RespondFailedReqWrapper wraps the RespondActivityTaskFailedRequest with context-specific data.
+type RespondFailedReqWrapper struct {
+	Request        *historyservice.RespondActivityTaskFailedRequest
+	Token          *tokenspb.Task
+	MetricsHandler metrics.Handler
+}
+
+// RespondCancelledReqWrapper wraps the RespondActivityTaskCanceledRequest with context-specific data.
+type RespondCancelledReqWrapper struct {
+	Request        *historyservice.RespondActivityTaskCanceledRequest
+	Token          *tokenspb.Task
+	MetricsHandler metrics.Handler
 }
 
 func (a *Activity) LifecycleState(_ chasm.Context) chasm.LifecycleState {
@@ -142,6 +158,20 @@ func (a *Activity) createAddActivityTaskRequest(ctx chasm.Context, namespaceID s
 		TaskQueue:              a.GetTaskQueue(),
 		Priority:               a.GetPriority(),
 		ComponentRef:           componentRef,
+	}, nil
+}
+
+// MetricsHandlerBuilderParams contains parameters for building a metrics handler for activity operations.
+type MetricsHandlerBuilderParams struct {
+	ActivityType  string
+	TaskQueueName string
+}
+
+// GetMetricsHandlerParams retrieves parameters for building a metrics handler for activity operations.
+func (a *Activity) GetMetricsHandlerParams(_ chasm.Context, _ context.Context) (MetricsHandlerBuilderParams, error) {
+	return MetricsHandlerBuilderParams{
+		ActivityType:  a.GetActivityType().GetName(),
+		TaskQueueName: a.GetTaskQueue().GetName(),
 	}, nil
 }
 
@@ -244,7 +274,7 @@ func (a *Activity) RecordCompleted(ctx chasm.MutableContext, applyFn func(ctx ch
 // HandleCompleted updates the activity on activity completion.
 func (a *Activity) HandleCompleted(
 	ctx chasm.MutableContext,
-	req RequestWithContext[*historyservice.RespondActivityTaskCompletedRequest],
+	req RespondCompletedReqWrapper,
 ) (*historyservice.RespondActivityTaskCompletedResponse, error) {
 	// TODO(dan): add test coverage for this validation
 	if err := ValidateActivityTaskToken(ctx, a, req.Token); err != nil {
@@ -262,7 +292,7 @@ func (a *Activity) HandleCompleted(
 // for retry instead.
 func (a *Activity) HandleFailed(
 	ctx chasm.MutableContext,
-	req RequestWithContext[*historyservice.RespondActivityTaskFailedRequest],
+	req RespondFailedReqWrapper,
 ) (*historyservice.RespondActivityTaskFailedResponse, error) {
 	// TODO(dan): add test coverage for this validation
 	if err := ValidateActivityTaskToken(ctx, a, req.Token); err != nil {
@@ -278,15 +308,13 @@ func (a *Activity) HandleFailed(
 
 	if shouldRetry {
 		if err := TransitionRescheduled.Apply(a, ctx, rescheduleEvent{
-			retryInterval:               retryInterval,
-			failure:                     failure,
-			handler:                     req.MetricsHandler,
-			namespace:                   req.NamespaceName,
-			breakdownMetricsByTaskQueue: req.BreakdownMetricsByTaskQueue,
-			operationTag:                metrics.HistoryRespondActivityTaskFailedScope,
+			retryInterval: retryInterval,
+			failure:       failure,
 		}); err != nil {
 			return nil, err
 		}
+
+		a.emitOnAttemptFailedMetrics(ctx, req.MetricsHandler)
 
 		return &historyservice.RespondActivityTaskFailedResponse{}, nil
 	}
@@ -302,7 +330,7 @@ func (a *Activity) HandleFailed(
 // HandleCanceled updates the activity on activity canceled.
 func (a *Activity) HandleCanceled(
 	ctx chasm.MutableContext,
-	req RequestWithContext[*historyservice.RespondActivityTaskCanceledRequest],
+	req RespondCancelledReqWrapper,
 ) (*historyservice.RespondActivityTaskCanceledResponse, error) {
 	// TODO(dan): add test coverage for this validation
 	if err := ValidateActivityTaskToken(ctx, a, req.Token); err != nil {
@@ -520,7 +548,7 @@ func createHeartbeatTimeoutFailure() *failurepb.Failure {
 // RecordHeartbeat records a heartbeat for the activity.
 func (a *Activity) RecordHeartbeat(
 	ctx chasm.MutableContext,
-	req RequestWithContext[*historyservice.RecordActivityTaskHeartbeatRequest],
+	req WithToken[*historyservice.RecordActivityTaskHeartbeatRequest],
 ) (*historyservice.RecordActivityTaskHeartbeatResponse, error) {
 	if err := ValidateActivityTaskToken(ctx, a, req.Token); err != nil {
 		return nil, err
@@ -532,8 +560,6 @@ func (a *Activity) RecordHeartbeat(
 		RecordedTime: timestamppb.New(ctx.Now(a)),
 		Details:      details,
 	})
-
-	recordPayloadSize(details.Size(), req.MetricsHandler, req.NamespaceName.String(), metrics.HistoryRecordActivityTaskHeartbeatScope)
 
 	return &historyservice.RecordActivityTaskHeartbeatResponse{
 		CancelRequested: a.Status == activitypb.ACTIVITY_EXECUTION_STATUS_CANCEL_REQUESTED,
@@ -697,102 +723,84 @@ func (a *Activity) buildPollActivityExecutionResponse(
 	}, nil
 }
 
-// recordOnAttemptedMetrics records metrics for attempted activities, including retries and originating from any
-// terminal state transitions.
-func (a *Activity) recordOnAttemptedMetrics(
-	startedTime time.Time,
-	namespaceName string,
-	metricsHandler metrics.Handler,
-	breakdownMetricsByTaskQueue dynamicconfig.BoolPropertyFnWithTaskQueueFilter,
-	operationTag string,
-	timeoutType enumspb.TimeoutType,
-) {
-	taskQueueFamily := a.GetTaskQueue().GetName()
+func (a *Activity) emitOnAttemptTimedOutMetrics(ctx chasm.Context, handler metrics.Handler, timeoutType enumspb.TimeoutType) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
 
-	handler := metrics.GetPerTaskQueueFamilyScope(
-		metricsHandler,
-		namespaceName,
-		tqid.UnsafeTaskQueueFamily(namespaceName, taskQueueFamily),
-		breakdownMetricsByTaskQueue(namespaceName, taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
-		metrics.OperationTag(operationTag),
-		metrics.ActivityTypeTag(a.GetActivityType().GetName()),
-		// metrics.VersioningBehaviorTag(versioningBehavior), TODO add when we have versioning
-	)
+	latency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(latency)
 
-	if !startedTime.IsZero() {
-		latency := time.Since(startedTime)
-		metrics.ActivityStartToCloseLatency.With(handler).Record(latency)
-	}
-
-	switch operationTag {
-	case metrics.HistoryRespondActivityTaskFailedScope:
-		metrics.ActivityTaskFail.With(handler).Record(1)
-	case metrics.TimerActiveTaskActivityTimeoutScope:
-		timeoutTag := metrics.StringTag("timeout_type", timeoutType.String())
-		metrics.ActivityTaskTimeout.With(handler).Record(1, timeoutTag)
-	default:
-		// Ignore
-	}
+	timeoutTag := metrics.StringTag("timeout_type", timeoutType.String())
+	metrics.ActivityTaskTimeout.With(handler).Record(1, timeoutTag)
 }
 
-// recordOnClosedMetrics records metrics on transition to a terminal state. It always calls recordOnAttemptedMetrics to
-// record metrics for the attempted activity as this transition is also an attempt..
-func (a *Activity) recordOnClosedMetrics(
-	startedTime time.Time,
-	namespaceName string,
-	metricsHandler metrics.Handler,
-	breakdownMetricsByTaskQueue dynamicconfig.BoolPropertyFnWithTaskQueueFilter,
-	operationTag string,
-	timeoutType enumspb.TimeoutType,
-) {
-	a.recordOnAttemptedMetrics(
-		startedTime,
-		namespaceName,
-		metricsHandler,
-		breakdownMetricsByTaskQueue,
-		operationTag,
-		timeoutType)
+func (a *Activity) emitOnAttemptFailedMetrics(ctx chasm.Context, handler metrics.Handler) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
 
-	taskQueueFamily := a.GetTaskQueue().GetName()
+	latency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(latency)
 
-	handler := metrics.GetPerTaskQueueFamilyScope(
-		metricsHandler,
-		namespaceName,
-		tqid.UnsafeTaskQueueFamily(namespaceName, taskQueueFamily),
-		breakdownMetricsByTaskQueue(namespaceName, taskQueueFamily, enumspb.TASK_QUEUE_TYPE_ACTIVITY),
-		metrics.OperationTag(operationTag),
-		metrics.ActivityTypeTag(a.GetActivityType().GetName()),
-		// metrics.VersioningBehaviorTag(versioningBehavior), TODO add when we have versioning
-	)
+	metrics.ActivityTaskFail.With(handler).Record(1)
+}
+
+func (a *Activity) emitOnCompletedMetrics(ctx chasm.Context, handler metrics.Handler) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
+
+	startToCloseLatency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(startToCloseLatency)
 
 	scheduleToCloseLatency := time.Since(a.GetScheduledTime().AsTime())
 	metrics.ActivityScheduleToCloseLatency.With(handler).Record(scheduleToCloseLatency)
 
-	switch operationTag {
-	case metrics.HistoryRespondActivityTaskCompletedScope:
-		metrics.ActivitySuccess.With(handler).Record(1)
-	case metrics.HistoryRespondActivityTaskFailedScope:
-		metrics.ActivityFail.With(handler).Record(1)
-	case metrics.HistoryRespondActivityTaskCanceledScope:
-		metrics.ActivityCancel.With(handler).Record(1)
-	case metrics.TimerActiveTaskActivityTimeoutScope:
-		timeoutTag := metrics.StringTag("timeout_type", timeoutType.String())
-		metrics.ActivityTimeout.With(handler).Record(1, timeoutTag)
-	default:
-		// Ignore
-	}
+	metrics.ActivitySuccess.With(handler).Record(1)
 }
 
-func recordPayloadSize(
-	payloadSize int,
-	handler metrics.Handler,
-	namespaceName string,
-	operationTag string,
-) {
-	if payloadSize > 0 {
-		metrics.ActivityPayloadSize.With(handler).Record(
-			int64(payloadSize),
-			metrics.OperationTag(operationTag),
-			metrics.NamespaceTag(namespaceName))
-	}
+func (a *Activity) emitOnFailedMetrics(ctx chasm.Context, handler metrics.Handler) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
+
+	startToCloseLatency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(startToCloseLatency)
+
+	scheduleToCloseLatency := time.Since(a.GetScheduledTime().AsTime())
+	metrics.ActivityScheduleToCloseLatency.With(handler).Record(scheduleToCloseLatency)
+
+	metrics.ActivityTaskFail.With(handler).Record(1)
+	metrics.ActivityFail.With(handler).Record(1)
+}
+
+func (a *Activity) emitOnCanceledMetrics(ctx chasm.Context, handler metrics.Handler) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
+
+	startToCloseLatency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(startToCloseLatency)
+
+	scheduleToCloseLatency := time.Since(a.GetScheduledTime().AsTime())
+	metrics.ActivityScheduleToCloseLatency.With(handler).Record(scheduleToCloseLatency)
+
+	metrics.ActivityCancel.With(handler).Record(1)
+}
+
+func (a *Activity) emitOnTimedOutMetrics(ctx chasm.Context, handler metrics.Handler, timeoutType enumspb.TimeoutType) {
+	// TODO ignore err for now as it won't be there after rebase on main
+	attempt, _ := a.Attempt.Get(ctx)
+	startedTime := attempt.GetStartedTime().AsTime()
+
+	startToCloseLatency := time.Since(startedTime)
+	metrics.ActivityStartToCloseLatency.With(handler).Record(startToCloseLatency)
+
+	scheduleToCloseLatency := time.Since(a.GetScheduledTime().AsTime())
+	metrics.ActivityScheduleToCloseLatency.With(handler).Record(scheduleToCloseLatency)
+
+	timeoutTag := metrics.StringTag("timeout_type", timeoutType.String())
+	metrics.ActivityTaskTimeout.With(handler).Record(1, timeoutTag)
+	metrics.ActivityTimeout.With(handler).Record(1, timeoutTag)
 }

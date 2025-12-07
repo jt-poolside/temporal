@@ -22,8 +22,7 @@ func Invoke(
 	shard historyi.ShardContext,
 	workflowConsistencyChecker api.WorkflowConsistencyChecker,
 ) (resp *historyservice.RecordActivityTaskHeartbeatResponse, retError error) {
-	namespaceEntry, err := api.GetActiveNamespace(shard, namespace.ID(req.GetNamespaceId()))
-	namespaceName := namespaceEntry.Name()
+	_, err := api.GetActiveNamespace(shard, namespace.ID(req.GetNamespaceId()))
 	if err != nil {
 		return nil, err
 	}
@@ -41,11 +40,9 @@ func Invoke(
 			ctx,
 			componentRef,
 			(*activity.Activity).RecordHeartbeat,
-			activity.RequestWithContext[*historyservice.RecordActivityTaskHeartbeatRequest]{
-				Token:          token,
-				Request:        req,
-				MetricsHandler: shard.GetMetricsHandler(),
-				NamespaceName:  namespaceName,
+			activity.WithToken[*historyservice.RecordActivityTaskHeartbeatRequest]{
+				Token:   token,
+				Request: req,
 			},
 		)
 		return response, err
